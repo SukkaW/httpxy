@@ -96,6 +96,12 @@ export function proxyUpgrade(
 ): Promise<Socket> {
   const resolvedAddr = parseAddr(addr);
 
+  // Detect SSL from addr string protocol (wss:// or https://)
+  let useSSL = false;
+  if (typeof addr === "string" && !addr.startsWith("unix:")) {
+    useSSL = isSSL.test(new URL(addr).protocol);
+  }
+
   // Validate WS upgrade request
   if (req.method !== "GET" || req.headers.upgrade?.toLowerCase() !== "websocket") {
     socket.destroy();
@@ -114,7 +120,7 @@ export function proxyUpgrade(
   }
 
   // Build target URL for setupOutgoing
-  const target = _buildTargetURL(resolvedAddr);
+  const target = _buildTargetURL(resolvedAddr, useSSL);
   const requestOptions: ProxyUpgradeOptions & { target: URL } = {
     ...opts,
     target,
@@ -159,6 +165,9 @@ export function proxyUpgrade(
           );
           res.on("error", onOutgoingError);
           res.pipe(sock);
+        } else {
+          // Socket already gone — consume response to avoid unhandled stream errors
+          res.resume();
         }
         if (!settled) {
           settled = true;
@@ -210,13 +219,14 @@ export function proxyUpgrade(
 
 // --- Internal ---
 
-function _buildTargetURL(addr: ProxyAddr): URL {
+function _buildTargetURL(addr: ProxyAddr, useSSL = false): URL {
+  const protocol = useSSL ? "https" : "http";
   if (addr.socketPath) {
-    const url = new URL("http://unix");
+    const url = new URL(`${protocol}://unix`);
     (url as any).socketPath = addr.socketPath;
     return url;
   }
-  return new URL(`http://${addr.host || "localhost"}${addr.port ? `:${addr.port}` : ""}`);
+  return new URL(`${protocol}://${addr.host || "localhost"}${addr.port ? `:${addr.port}` : ""}`);
 }
 
 function _createHttpHeader(

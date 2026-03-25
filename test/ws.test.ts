@@ -1,4 +1,7 @@
 import { createServer, type Server, type IncomingMessage } from "node:http";
+import { createServer as createHTTPSServer } from "node:https";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import { Duplex } from "node:stream";
 import { connect, type AddressInfo } from "node:net";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
@@ -681,6 +684,172 @@ describe("proxyUpgrade", () => {
       targetWs.close();
       targetServer.close();
       proxy.close();
+    });
+  });
+
+  describe("wss:// (TLS upstream)", () => {
+    const __dirname = new URL(".", import.meta.url).pathname;
+    const sslOpts = {
+      key: readFileSync(join(__dirname, "fixtures", "agent2-key.pem")),
+      cert: readFileSync(join(__dirname, "fixtures", "agent2-cert.pem")),
+    };
+
+    it("should use HTTPS request for wss:// addr", async () => {
+      // Create an HTTPS server with WebSocket support
+      const httpsServer = createHTTPSServer(sslOpts);
+      const targetWs = new ws.WebSocketServer({ server: httpsServer });
+
+      targetWs.on("connection", (socket) => {
+        socket.on("message", (msg) => {
+          socket.send("secure-echo:" + msg.toString("utf8"));
+        });
+      });
+
+      await new Promise<void>((resolve) => {
+        httpsServer.listen(0, "127.0.0.1", resolve);
+      });
+      const targetPort = (httpsServer.address() as AddressInfo).port;
+
+      const proxy = createProxyServer(`wss://127.0.0.1:${targetPort}`, {
+        secure: false,
+      });
+      const proxyPort = await listenServer(proxy);
+
+      const { promise, resolve } = Promise.withResolvers<void>();
+      const client = new ws.WebSocket("ws://127.0.0.1:" + proxyPort);
+
+      client.on("open", () => {
+        client.send("tls-test");
+      });
+
+      client.on("message", (msg) => {
+        expect(msg.toString("utf8")).toBe("secure-echo:tls-test");
+        client.close();
+        targetWs.close();
+        httpsServer.close();
+        proxy.close(() => resolve());
+      });
+
+      client.on("error", (err) => {
+        targetWs.close();
+        httpsServer.close();
+        proxy.close();
+        throw err;
+      });
+
+      await promise;
+    });
+
+    it("should use HTTPS request for https:// addr", async () => {
+      const httpsServer = createHTTPSServer(sslOpts);
+      const targetWs = new ws.WebSocketServer({ server: httpsServer });
+
+      targetWs.on("connection", (socket) => {
+        socket.on("message", (msg) => {
+          socket.send("https-echo:" + msg.toString("utf8"));
+        });
+      });
+
+      await new Promise<void>((resolve) => {
+        httpsServer.listen(0, "127.0.0.1", resolve);
+      });
+      const targetPort = (httpsServer.address() as AddressInfo).port;
+
+      const proxy = createProxyServer(`https://127.0.0.1:${targetPort}`, {
+        secure: false,
+      });
+      const proxyPort = await listenServer(proxy);
+
+      const { promise, resolve } = Promise.withResolvers<void>();
+      const client = new ws.WebSocket("ws://127.0.0.1:" + proxyPort);
+
+      client.on("open", () => {
+        client.send("https-test");
+      });
+
+      client.on("message", (msg) => {
+        expect(msg.toString("utf8")).toBe("https-echo:https-test");
+        client.close();
+        targetWs.close();
+        httpsServer.close();
+        proxy.close(() => resolve());
+      });
+
+      client.on("error", (err) => {
+        targetWs.close();
+        httpsServer.close();
+        proxy.close();
+        throw err;
+      });
+
+      await promise;
+    });
+
+    it("should use plain HTTP request for ws:// addr (no TLS)", async () => {
+      // Verify ws:// still uses plain HTTP (not HTTPS)
+      const proxy = createProxyServer({ host: "127.0.0.1", port: wsPort });
+      const proxyPort = await listenServer(proxy);
+
+      const { promise, resolve } = Promise.withResolvers<void>();
+      const client = new ws.WebSocket("ws://127.0.0.1:" + proxyPort);
+
+      client.on("open", () => {
+        client.send("plain-test");
+      });
+
+      client.on("message", (msg) => {
+        expect(msg.toString("utf8")).toBe("echo:plain-test");
+        client.close();
+        proxy.close(() => resolve());
+      });
+
+      await promise;
+    });
+  });
+
+  describe("non-upgrade response with destroyed socket", () => {
+    it("should consume response body when socket is already destroyed", async () => {
+      // Regression: when the client socket is destroyed before the upstream
+      // non-upgrade response arrives, the response stream must be consumed
+      // (res.resume()) to avoid unhandled stream errors.
+      const { promise: targetReqReceived, resolve: onTargetReq } = Promise.withResolvers<void>();
+      const { promise: canRespond, resolve: allowResponse } = Promise.withResolvers<void>();
+
+      const targetServer = createServer(async (_req, res) => {
+        onTargetReq();
+        await canRespond;
+        // Send a larger response body to make unconsumed stream errors more likely
+        res.writeHead(503);
+        res.end("Service Unavailable — " + "x".repeat(1024));
+      });
+      const targetPort = await listenServer(targetServer);
+
+      const server = createServer();
+      const { promise, resolve } = Promise.withResolvers<void>();
+
+      server.on("upgrade", (req, socket, head) => {
+        // Destroy socket before upstream responds
+        targetReqReceived.then(() => {
+          socket.destroy();
+          setTimeout(allowResponse, 10);
+        });
+
+        proxyUpgrade({ host: "127.0.0.1", port: targetPort }, req, socket, head).catch(() => {
+          // Give time for any potential unhandled stream errors to surface
+          setTimeout(resolve, 50);
+        });
+      });
+
+      const port = await listenServer(server);
+
+      const sock = connect(port, "127.0.0.1", () => {
+        sock.write(wsUpgradeRequest(port));
+      });
+      sock.on("error", () => {});
+
+      await promise;
+      targetServer.close();
+      server.close();
     });
   });
 });

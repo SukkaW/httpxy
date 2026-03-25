@@ -98,15 +98,20 @@ export const stream = defineProxyMiddleware<Socket>(
       // if upgrade event isn't going to happen, close the socket
       // guard against writing to an already-destroyed socket
       // (https://github.com/http-party/node-http-proxy/pull/1433)
-      if (!(res as any).upgrade && !socket.destroyed && socket.writable) {
-        socket.write(
-          createHttpHeader(
-            "HTTP/" + res.httpVersion + " " + res.statusCode + " " + res.statusMessage,
-            res.headers,
-          ),
-        );
-        res.on("error", onOutgoingError);
-        res.pipe(socket);
+      if (!(res as any).upgrade) {
+        if (!socket.destroyed && socket.writable) {
+          socket.write(
+            createHttpHeader(
+              "HTTP/" + res.httpVersion + " " + res.statusCode + " " + res.statusMessage,
+              res.headers,
+            ),
+          );
+          res.on("error", onOutgoingError);
+          res.pipe(socket);
+        } else {
+          // Socket already gone — consume response to avoid unhandled stream errors
+          res.resume();
+        }
       }
     });
 
@@ -117,6 +122,10 @@ export const stream = defineProxyMiddleware<Socket>(
       proxySocket.on("end", function () {
         server.emit("close", proxyRes, proxySocket, proxyHead);
       });
+
+      // Remove the pre-upgrade error handler — it calls proxyReq.destroy()
+      // which is pointless after upgrade and emits a spurious error event.
+      socket.removeListener("error", onSocketError);
 
       // The pipe below will end proxySocket if socket closes cleanly, but not
       // if it errors (eg, vanishes from the net and starts returning
