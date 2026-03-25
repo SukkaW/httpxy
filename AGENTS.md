@@ -106,13 +106,24 @@ Returns Promise<Socket> (the upstream proxy socket)
 
 ### `proxyFetch` semantics
 
-- `proxyFetch` is HTTP-only upstream (`node:http` request); HTTPS upstream targets are not supported.
-- `addr` accepts `http://host:port`, `unix:/path.sock`, or object form `{ host, port }` / `{ socketPath }`.
+- `addr` accepts `http://host:port`, `https://host:port`, `unix:/path.sock`, or object form `{ host, port }` / `{ socketPath }`.
+- Both HTTP and HTTPS upstream targets are supported. HTTPS is auto-detected from the `addr` string protocol.
+- When `addr` is a URL string with a path (e.g. `http://host:port/api`), the path is prepended to the request path via `joinURL()`.
 - Redirect mode defaults to `manual`.
 - Streaming request bodies are supported (`ReadableStream`) and set `duplex: "half"`.
 - Hop-by-hop response headers `transfer-encoding`, `keep-alive`, `connection` are stripped.
 - Response body is `null` for `204` and `304`.
 - Network and request-body-stream errors reject the Promise.
+- Accepts optional `ProxyFetchOptions` as 4th argument with `timeout`, `xfwd`, `changeOrigin`, `agent`, `followRedirects`, and `ssl`.
+- `timeout` sets a deadline on the upstream request; rejects with `"Proxy request timed out"` on expiry.
+- `xfwd` adds `x-forwarded-for`, `x-forwarded-port`, `x-forwarded-proto`, `x-forwarded-host` derived from the input URL (not from a socket, since there is no incoming connection). Existing headers are not overwritten.
+- `changeOrigin` rewrites the `Host` header to match the resolved target address (host:port for TCP, `localhost` for Unix sockets). Accounts for default ports (80 for HTTP, 443 for HTTPS).
+- `agent` enables connection pooling/reuse via a custom `http.Agent`. Defaults to `false` (no agent).
+- `followRedirects` enables automatic redirect following. `true` = max 5 hops; number = custom max. On 301/302/303 method changes to GET and body is dropped. On 307/308 method and body are preserved (body is buffered). Sensitive headers (`authorization`, `cookie`) are stripped on cross-origin redirects.
+- `ssl` passes TLS options to `https.request` (e.g. `{ rejectUnauthorized: false }`).
+- `AbortSignal` support is wired through `init.signal` (standard `RequestInit`), aborting the underlying `http.request`.
+- Multi-value request headers are preserved as arrays (not flattened by the `Headers` API).
+- Body types `ArrayBuffer`, `TypedArray`, and `Blob` are properly converted to `Buffer` before sending.
 
 ### `proxyUpgrade` semantics
 
@@ -130,7 +141,7 @@ Returns Promise<Socket> (the upstream proxy socket)
 ```
 test/
 ├── index.test.ts                  — Main proxy: paths, headers, changeOrigin, xfwd, WebSocket, errors
-├── fetch.test.ts                  — proxyFetch: TCP/Unix, GET/POST, redirects, cookies, 204/304
+├── fetch.test.ts                  — proxyFetch: TCP/Unix, GET/POST, redirects, cookies, 204/304, signal, timeout, xfwd, changeOrigin
 ├── upgrade.test.ts                — proxyUpgrade: WS proxy, addr formats, xfwd, error handling
 ├── http-proxy.test.ts             — Forward, target, WebSocket, socket.io, SSE, timeouts, error events
 ├── https-proxy.test.ts            — HTTPS targets, SSL certs, certificate validation

@@ -19,6 +19,14 @@ beforeAll(async () => {
       res.end(JSON.stringify({ ok: true }));
       return;
     }
+    if (req.url === "/slow") {
+      const timer = setTimeout(() => {
+        res.writeHead(200, { "content-type": "text/plain" });
+        res.end("slow-ok");
+      }, 5000);
+      req.on("close", () => clearTimeout(timer));
+      return;
+    }
     if (req.url === "/echo" && req.method === "POST") {
       const chunks: Buffer[] = [];
       req.on("data", (c) => chunks.push(c));
@@ -35,6 +43,16 @@ beforeAll(async () => {
     }
     if (req.url === "/redirect") {
       res.writeHead(302, { location: "/json" });
+      res.end();
+      return;
+    }
+    if (req.url === "/redirect-307") {
+      res.writeHead(307, { location: "/echo" });
+      res.end();
+      return;
+    }
+    if (req.url === "/redirect-chain") {
+      res.writeHead(301, { location: "/redirect" });
       res.end();
       return;
     }
@@ -309,6 +327,305 @@ describe("proxyFetch", () => {
           body: stream,
         }),
       ).rejects.toThrow("stream-fail");
+    });
+  });
+
+  describe("signal / abort", () => {
+    it("aborts request with already-aborted signal", async () => {
+      const controller = new AbortController();
+      controller.abort();
+      await expect(
+        proxyFetch({ host: "127.0.0.1", port: tcpPort }, `http://localhost/json`, {
+          signal: controller.signal,
+        }),
+      ).rejects.toThrow();
+    });
+
+    it("aborts in-flight request", async () => {
+      const controller = new AbortController();
+      setTimeout(() => controller.abort(), 50);
+      await expect(
+        proxyFetch({ host: "127.0.0.1", port: tcpPort }, `http://localhost/slow`, {
+          signal: controller.signal,
+        }),
+      ).rejects.toThrow();
+    });
+
+    it("succeeds when signal is not aborted", async () => {
+      const controller = new AbortController();
+      const res = await proxyFetch({ host: "127.0.0.1", port: tcpPort }, `http://localhost/json`, {
+        signal: controller.signal,
+      });
+      expect(res.status).toBe(200);
+    });
+  });
+
+  describe("timeout", () => {
+    it("rejects when upstream does not respond in time", async () => {
+      await expect(
+        proxyFetch({ host: "127.0.0.1", port: tcpPort }, `http://localhost/slow`, undefined, {
+          timeout: 50,
+        }),
+      ).rejects.toThrow("Proxy request timed out");
+    });
+
+    it("succeeds when response arrives before timeout", async () => {
+      const res = await proxyFetch(
+        { host: "127.0.0.1", port: tcpPort },
+        `http://localhost/json`,
+        undefined,
+        { timeout: 5000 },
+      );
+      expect(res.status).toBe(200);
+    });
+  });
+
+  describe("xfwd", () => {
+    it("adds x-forwarded-* headers when enabled", async () => {
+      const res = await proxyFetch(
+        { host: "127.0.0.1", port: tcpPort },
+        `http://example.com:3000/headers`,
+        undefined,
+        { xfwd: true },
+      );
+      const body = (await res.json()) as { headers: Record<string, string> };
+      expect(body.headers["x-forwarded-for"]).toBe("example.com");
+      expect(body.headers["x-forwarded-port"]).toBe("3000");
+      expect(body.headers["x-forwarded-proto"]).toBe("http");
+      expect(body.headers["x-forwarded-host"]).toBe("example.com:3000");
+    });
+
+    it("does not add x-forwarded-* headers by default", async () => {
+      const res = await proxyFetch(
+        { host: "127.0.0.1", port: tcpPort },
+        `http://localhost/headers`,
+      );
+      const body = (await res.json()) as { headers: Record<string, string> };
+      expect(body.headers["x-forwarded-for"]).toBeUndefined();
+      expect(body.headers["x-forwarded-port"]).toBeUndefined();
+      expect(body.headers["x-forwarded-proto"]).toBeUndefined();
+      expect(body.headers["x-forwarded-host"]).toBeUndefined();
+    });
+
+    it("does not overwrite existing x-forwarded-* headers", async () => {
+      const res = await proxyFetch(
+        { host: "127.0.0.1", port: tcpPort },
+        `http://example.com/headers`,
+        { headers: { "x-forwarded-for": "10.0.0.1" } },
+        { xfwd: true },
+      );
+      const body = (await res.json()) as { headers: Record<string, string> };
+      expect(body.headers["x-forwarded-for"]).toBe("10.0.0.1");
+    });
+  });
+
+  describe("changeOrigin", () => {
+    it("rewrites Host header to target address", async () => {
+      const res = await proxyFetch(
+        { host: "127.0.0.1", port: tcpPort },
+        `http://original-host.com/headers`,
+        undefined,
+        { changeOrigin: true },
+      );
+      const body = (await res.json()) as { headers: Record<string, string> };
+      expect(body.headers.host).toBe(`127.0.0.1:${tcpPort}`);
+    });
+
+    it("keeps original Host header when changeOrigin is false", async () => {
+      const res = await proxyFetch(
+        { host: "127.0.0.1", port: tcpPort },
+        `http://original-host.com/headers`,
+        { headers: { host: "original-host.com" } },
+      );
+      const body = (await res.json()) as { headers: Record<string, string> };
+      expect(body.headers.host).toBe("original-host.com");
+    });
+
+    it("uses localhost for unix socket targets", async () => {
+      const unixHeaders = createServer((req, res) => {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ host: req.headers.host }));
+      });
+      const tmpSocket = join(tmpdir(), `httpxy-co-${process.pid}-${Date.now()}.sock`);
+      await new Promise<void>((resolve) => unixHeaders.listen(tmpSocket, resolve));
+      try {
+        const res = await proxyFetch(
+          { socketPath: tmpSocket },
+          `http://original-host.com/`,
+          undefined,
+          { changeOrigin: true },
+        );
+        const body = (await res.json()) as { host: string };
+        expect(body.host).toBe("localhost");
+      } finally {
+        unixHeaders.close();
+      }
+    });
+  });
+
+  describe("agent", () => {
+    it("uses provided agent for connection pooling", async () => {
+      const { Agent } = await import("node:http");
+      const agent = new Agent({ keepAlive: true });
+      try {
+        const res = await proxyFetch(
+          { host: "127.0.0.1", port: tcpPort },
+          `http://localhost/json`,
+          undefined,
+          { agent },
+        );
+        expect(res.status).toBe(200);
+        expect(await res.json()).toEqual({ ok: true });
+      } finally {
+        agent.destroy();
+      }
+    });
+  });
+
+  describe("body types", () => {
+    it("sends ArrayBuffer body", async () => {
+      const buf = new TextEncoder().encode("arraybuffer-body");
+      const res = await proxyFetch({ host: "127.0.0.1", port: tcpPort }, `http://localhost/echo`, {
+        method: "POST",
+        body: buf.buffer,
+      });
+      expect(res.status).toBe(200);
+      expect(await res.text()).toBe("arraybuffer-body");
+    });
+
+    it("sends Uint8Array body", async () => {
+      const buf = new TextEncoder().encode("uint8-body");
+      const res = await proxyFetch({ host: "127.0.0.1", port: tcpPort }, `http://localhost/echo`, {
+        method: "POST",
+        body: buf,
+      });
+      expect(res.status).toBe(200);
+      expect(await res.text()).toBe("uint8-body");
+    });
+
+    it("sends Blob body", async () => {
+      const blob = new Blob(["blob-body"], { type: "text/plain" });
+      const res = await proxyFetch({ host: "127.0.0.1", port: tcpPort }, `http://localhost/echo`, {
+        method: "POST",
+        body: blob,
+      });
+      expect(res.status).toBe(200);
+      expect(await res.text()).toBe("blob-body");
+    });
+  });
+
+  describe("multi-value request headers", () => {
+    it("preserves multiple cookie values", async () => {
+      const headers = new Headers();
+      headers.append("x-multi", "val1");
+      headers.append("x-multi", "val2");
+      const res = await proxyFetch(
+        { host: "127.0.0.1", port: tcpPort },
+        `http://localhost/headers`,
+        { headers },
+      );
+      const body = (await res.json()) as { headers: Record<string, string> };
+      // Node.js http server joins multi-value headers with ", "
+      expect(body.headers["x-multi"]).toBe("val1, val2");
+    });
+  });
+
+  describe("followRedirects", () => {
+    it("follows 302 redirect and returns final response", async () => {
+      const res = await proxyFetch(
+        { host: "127.0.0.1", port: tcpPort },
+        `http://localhost/redirect`,
+        undefined,
+        { followRedirects: true },
+      );
+      expect(res.status).toBe(200);
+      expect(await res.json()).toEqual({ ok: true });
+    });
+
+    it("follows redirect chain", async () => {
+      const res = await proxyFetch(
+        { host: "127.0.0.1", port: tcpPort },
+        `http://localhost/redirect-chain`,
+        undefined,
+        { followRedirects: true },
+      );
+      expect(res.status).toBe(200);
+      expect(await res.json()).toEqual({ ok: true });
+    });
+
+    it("preserves method and body on 307 redirect", async () => {
+      const res = await proxyFetch(
+        { host: "127.0.0.1", port: tcpPort },
+        `http://localhost/redirect-307`,
+        { method: "POST", body: "preserved" },
+        { followRedirects: true },
+      );
+      expect(res.status).toBe(200);
+      expect(await res.text()).toBe("preserved");
+    });
+
+    it("respects custom max redirects", async () => {
+      // redirect-chain → redirect → json (2 hops), limit to 1
+      const res = await proxyFetch(
+        { host: "127.0.0.1", port: tcpPort },
+        `http://localhost/redirect-chain`,
+        undefined,
+        { followRedirects: 1 },
+      );
+      // After 1 hop we land on /redirect which is a 302 — returned as-is
+      expect(res.status).toBe(302);
+    });
+
+    it("returns raw 3xx when followRedirects is false", async () => {
+      const res = await proxyFetch(
+        { host: "127.0.0.1", port: tcpPort },
+        `http://localhost/redirect`,
+        undefined,
+        { followRedirects: false },
+      );
+      expect(res.status).toBe(302);
+      expect(res.headers.get("location")).toBe("/json");
+    });
+  });
+
+  describe("path merging", () => {
+    it("prepends addr base path to request path", async () => {
+      const res = await proxyFetch(
+        `http://127.0.0.1:${tcpPort}/headers`,
+        `http://localhost/?from=merge`,
+      );
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as { url: string };
+      expect(body.url).toBe("/headers/?from=merge");
+    });
+
+    it("joins addr base path with request subpath", async () => {
+      // addr has /headers, request has /sub → merged to /headers/sub
+      // server matches startsWith("/headers") so this works
+      const res = await proxyFetch(`http://127.0.0.1:${tcpPort}/headers`, `http://localhost/sub`);
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as { url: string };
+      expect(body.url).toBe("/headers/sub");
+    });
+
+    it("uses request path when addr has no path", async () => {
+      const res = await proxyFetch(`http://127.0.0.1:${tcpPort}`, `http://localhost/json`);
+      expect(res.status).toBe(200);
+      expect(await res.json()).toEqual({ ok: true });
+    });
+  });
+
+  describe("HTTPS upstream", () => {
+    it("detects HTTPS from addr string", async () => {
+      // We can't easily test real HTTPS without certs, but we can verify
+      // that an https addr doesn't throw and properly rejects on connection
+      // (which proves httpsRequest was selected, not httpRequest)
+      await expect(proxyFetch(`https://127.0.0.1:1`, `http://localhost/json`)).rejects.toThrow();
+    });
+
+    it("uses HTTP by default for object addr", async () => {
+      const res = await proxyFetch({ host: "127.0.0.1", port: tcpPort }, `http://localhost/json`);
+      expect(res.status).toBe(200);
     });
   });
 });

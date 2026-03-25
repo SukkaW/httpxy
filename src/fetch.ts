@@ -1,25 +1,78 @@
 import type { IncomingMessage, RequestOptions } from "node:http";
 import { request as httpRequest } from "node:http";
+import { request as httpsRequest } from "node:https";
 import { Readable } from "node:stream";
 import type { ProxyAddr } from "./types.ts";
-import { parseAddr } from "./_utils.ts";
+import { isSSL, joinURL, parseAddr } from "./_utils.ts";
+
+/**
+ * Options for {@link proxyFetch}.
+ */
+export interface ProxyFetchOptions {
+  /**
+   * Timeout in milliseconds for the upstream request.
+   * Rejects with an error if the upstream does not respond within this time.
+   */
+  timeout?: number;
+  /**
+   * Add `x-forwarded-for`, `x-forwarded-port`, `x-forwarded-proto`, and
+   * `x-forwarded-host` headers derived from the input URL.
+   * Default: `false`.
+   */
+  xfwd?: boolean;
+  /**
+   * Rewrite the `Host` header to match the target address.
+   * Default: `false` (original host from the input URL is kept).
+   */
+  changeOrigin?: boolean;
+  /**
+   * HTTP agent for connection pooling / reuse.
+   * Default: `false` (no agent, no keep-alive).
+   */
+  agent?: any;
+  /**
+   * Follow HTTP redirects from the upstream.
+   * `true` = max 5 hops; number = custom max.
+   * Default: `false` (manual redirect, raw 3xx responses are returned).
+   */
+  followRedirects?: boolean | number;
+  /**
+   * TLS options forwarded to `https.request` (e.g. `{ rejectUnauthorized: false }`).
+   * Also controls certificate verification — set `rejectUnauthorized: false` to skip.
+   * Default: none.
+   */
+  ssl?: Record<string, unknown>;
+}
 
 /**
  * Proxy a request to a specific server address (TCP host/port or Unix socket)
  * using web standard {@link Request}/{@link Response} interfaces.
  *
- * Note: Only plain HTTP is supported. HTTPS targets are not supported.
+ * Supports both HTTP and HTTPS upstream targets.
  *
- * @param addr - The target server address. Can be a URL string (`http://host:port`, `unix:/path`), or an object with `host`/`port` for TCP or `socketPath` for Unix sockets.
+ * @param addr - The target server address. Can be a URL string (`http://host:port`, `https://host:port`, `unix:/path`), or an object with `host`/`port` for TCP or `socketPath` for Unix sockets.
  * @param input - The request URL (string or URL) or a {@link Request} object.
  * @param inputInit - Optional {@link RequestInit} or {@link Request} to override method, headers, and body.
+ * @param opts - Optional proxy options.
  */
 export async function proxyFetch(
   addr: string | ProxyAddr,
   input: string | URL | Request,
   inputInit?: RequestInit | Request,
+  opts?: ProxyFetchOptions,
 ) {
   const resolvedAddr = parseAddr(addr);
+
+  // Detect protocol and base path from addr string
+  let useHTTPS = false;
+  let addrBasePath = "";
+  if (typeof addr === "string" && !addr.startsWith("unix:")) {
+    const addrURL = new URL(addr);
+    useHTTPS = isSSL.test(addrURL.protocol);
+    if (addrURL.pathname && addrURL.pathname !== "/") {
+      addrBasePath = addrURL.pathname;
+    }
+  }
 
   let url: URL;
   let init: RequestInit | undefined;
@@ -42,44 +95,82 @@ export async function proxyFetch(
     (init as RequestInit & { duplex: string }).duplex = "half";
   }
 
-  const path = url.pathname + url.search;
-  const reqHeaders: Record<string, string> = {};
+  // Merge addr base path with request path
+  const requestPath = url.pathname + url.search;
+  const path = addrBasePath ? joinURL(addrBasePath, requestPath) : requestPath;
+
+  const reqHeaders: Record<string, string | string[]> = {};
   if (init.headers) {
     const h =
       init.headers instanceof Headers ? init.headers : new Headers(init.headers as HeadersInit);
     for (const [key, value] of h) {
-      reqHeaders[key] = value;
+      // Preserve multi-value headers (e.g. set-cookie) as arrays
+      if (key in reqHeaders) {
+        const existing = reqHeaders[key];
+        reqHeaders[key] = Array.isArray(existing)
+          ? [...existing, value]
+          : [existing as string, value];
+      } else {
+        reqHeaders[key] = value;
+      }
     }
   }
 
-  const res = await new Promise<IncomingMessage>((resolve, reject) => {
-    const reqOpts: RequestOptions = {
-      method: init!.method || "GET",
-      path,
-      headers: reqHeaders,
-    };
+  // Add x-forwarded-* headers derived from the input URL
+  if (opts?.xfwd) {
+    if (!reqHeaders["x-forwarded-for"]) {
+      reqHeaders["x-forwarded-for"] = url.hostname;
+    }
+    if (!reqHeaders["x-forwarded-port"]) {
+      reqHeaders["x-forwarded-port"] = url.port || (url.protocol === "https:" ? "443" : "80");
+    }
+    if (!reqHeaders["x-forwarded-proto"]) {
+      reqHeaders["x-forwarded-proto"] = url.protocol.replace(":", "");
+    }
+    if (!reqHeaders["x-forwarded-host"]) {
+      reqHeaders["x-forwarded-host"] = url.host;
+    }
+  }
 
+  // Rewrite Host header to match the target address
+  if (opts?.changeOrigin) {
     if (resolvedAddr.socketPath) {
-      reqOpts.socketPath = resolvedAddr.socketPath;
+      reqHeaders.host = "localhost";
     } else {
-      reqOpts.hostname = resolvedAddr.host || "localhost";
-      reqOpts.port = resolvedAddr.port;
+      const targetHost = resolvedAddr.host || "localhost";
+      const targetPort = resolvedAddr.port;
+      const defaultPort = useHTTPS ? 443 : 80;
+      reqHeaders.host =
+        targetPort && targetPort !== defaultPort ? `${targetHost}:${targetPort}` : targetHost;
     }
+  }
 
-    const req = httpRequest(reqOpts, resolve);
-    req.on("error", reject);
+  const maxRedirects =
+    typeof opts?.followRedirects === "number"
+      ? opts.followRedirects
+      : opts?.followRedirects
+        ? 5
+        : 0;
 
-    if (init!.body instanceof ReadableStream) {
-      const readable = Readable.fromWeb(init!.body as import("node:stream/web").ReadableStream);
-      readable.on("error", reject);
-      readable.pipe(req);
-    } else if (init!.body) {
-      req.end(init!.body);
-    } else {
-      req.end();
-    }
-  });
+  const res = await _sendRequest(
+    useHTTPS ? httpsRequest : httpRequest,
+    init.method || "GET",
+    path,
+    reqHeaders,
+    resolvedAddr,
+    await _bufferBody(init.body),
+    {
+      signal: init.signal || undefined,
+      agent: opts?.agent,
+      timeout: opts?.timeout,
+      ssl: opts?.ssl,
+      maxRedirects,
+      redirectCount: 0,
+      originalHeaders: reqHeaders,
+    },
+  );
 
+  // Build Response
   const headers = new Headers();
   for (const [key, value] of Object.entries(res.headers)) {
     if (key === "transfer-encoding" || key === "keep-alive" || key === "connection") {
@@ -102,6 +193,8 @@ export async function proxyFetch(
   });
 }
 
+// --- Internal ---
+
 function toInit(init?: RequestInit | Request): RequestInit | undefined {
   if (!init) {
     return undefined;
@@ -115,4 +208,138 @@ function toInit(init?: RequestInit | Request): RequestInit | undefined {
     } as RequestInit;
   }
   return init;
+}
+
+/** Normalize any body type to Buffer (or undefined). */
+async function _bufferBody(body: BodyInit | null | undefined): Promise<Buffer | undefined> {
+  if (!body) {
+    return undefined;
+  }
+  if (body instanceof ReadableStream) {
+    const readable = Readable.fromWeb(body as import("node:stream/web").ReadableStream);
+    const chunks: Buffer[] = [];
+    for await (const chunk of readable) {
+      chunks.push(typeof chunk === "string" ? Buffer.from(chunk) : chunk);
+    }
+    return Buffer.concat(chunks);
+  }
+  if (body instanceof ArrayBuffer || ArrayBuffer.isView(body)) {
+    return Buffer.from(body as ArrayBuffer);
+  }
+  if (body instanceof Blob) {
+    return Buffer.from(await body.arrayBuffer());
+  }
+  return Buffer.from(body as string);
+}
+
+const _redirectStatuses = new Set([301, 302, 303, 307, 308]);
+
+interface _RequestOpts {
+  signal?: AbortSignal;
+  agent?: any;
+  timeout?: number;
+  ssl?: Record<string, unknown>;
+  maxRedirects: number;
+  redirectCount: number;
+  originalHeaders: Record<string, string | string[]>;
+}
+
+function _sendRequest(
+  doRequest: typeof httpRequest,
+  method: string,
+  path: string,
+  headers: Record<string, string | string[]>,
+  addr: ProxyAddr,
+  body: Buffer | undefined,
+  opts: _RequestOpts,
+): Promise<IncomingMessage> {
+  return new Promise<IncomingMessage>((resolve, reject) => {
+    const reqOpts: RequestOptions = {
+      method,
+      path,
+      headers,
+      agent: opts.agent ?? false,
+    };
+
+    if (addr.socketPath) {
+      reqOpts.socketPath = addr.socketPath;
+    } else {
+      reqOpts.hostname = addr.host || "localhost";
+      reqOpts.port = addr.port;
+    }
+
+    if (opts.signal) {
+      reqOpts.signal = opts.signal;
+    }
+
+    if (opts.ssl) {
+      Object.assign(reqOpts, opts.ssl);
+    }
+
+    const req = doRequest(reqOpts, (res) => {
+      const statusCode = res.statusCode!;
+
+      if (
+        opts.maxRedirects > 0 &&
+        _redirectStatuses.has(statusCode) &&
+        opts.redirectCount < opts.maxRedirects &&
+        res.headers.location
+      ) {
+        res.resume();
+
+        const currentURL = new URL(path, `http://${addr.host || "localhost"}:${addr.port || 80}`);
+        const location = new URL(res.headers.location, currentURL);
+        const redirectHTTPS = isSSL.test(location.protocol);
+
+        const preserveMethod = statusCode === 307 || statusCode === 308;
+        const redirectMethod = preserveMethod ? method : "GET";
+
+        const redirectHeaders: Record<string, string | string[]> = {
+          ...opts.originalHeaders,
+        };
+        redirectHeaders.host = location.host;
+
+        if (location.host !== currentURL.host) {
+          delete redirectHeaders.authorization;
+          delete redirectHeaders.cookie;
+        }
+
+        if (!preserveMethod) {
+          delete redirectHeaders["content-length"];
+          delete redirectHeaders["content-type"];
+          delete redirectHeaders["transfer-encoding"];
+        }
+
+        _sendRequest(
+          redirectHTTPS ? httpsRequest : httpRequest,
+          redirectMethod,
+          location.pathname + location.search,
+          redirectHeaders,
+          {
+            host: location.hostname,
+            port: Number(location.port) || (redirectHTTPS ? 443 : 80),
+          },
+          preserveMethod ? body : undefined,
+          { ...opts, redirectCount: opts.redirectCount + 1 },
+        ).then(resolve, reject);
+        return;
+      }
+
+      resolve(res);
+    });
+
+    req.on("error", reject);
+
+    if (opts.timeout) {
+      req.setTimeout(opts.timeout, () => {
+        req.destroy(new Error("Proxy request timed out"));
+      });
+    }
+
+    if (body) {
+      req.end(body);
+    } else {
+      req.end();
+    }
+  });
 }
