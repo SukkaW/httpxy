@@ -1,5 +1,56 @@
 # Changelog
 
+## v0.4.0
+
+[compare changes](https://github.com/unjs/httpxy/compare/v0.3.1...v0.4.0)
+
+### 🚀 Enhancements
+
+- Http/2 listener support ([#102](https://github.com/unjs/httpxy/pull/102))
+- **fetch:** Add proxyFetch options for timeout, xfwd, changeOrigin, agent, followRedirects, HTTPS, and path merging ([efa9711](https://github.com/unjs/httpxy/commit/efa9711))
+
+### 🩹 Fixes
+
+- **web-incoming:** Close downstream stream when upstream SSE aborts ([#103](https://github.com/unjs/httpxy/pull/103))
+- Handle relative Location URLs in redirect rewriting ([#20](https://github.com/unjs/httpxy/pull/20), [#104](https://github.com/unjs/httpxy/pull/104))
+- **web-outgoing:** Handle invalid response header characters gracefully ([#106](https://github.com/unjs/httpxy/pull/106))
+- **web-incoming:** Remove deprecated `req.abort()` and `req.on("aborted")` ([#107](https://github.com/unjs/httpxy/pull/107))
+- **web-outgoing:** Handle object target in redirect host rewrite ([#108](https://github.com/unjs/httpxy/pull/108))
+- **web-incoming:** Remove deprecated `req.on('aborted')` listener ([#110](https://github.com/unjs/httpxy/pull/110))
+- **ws:** Skip writing to closed socket on non-upgrade response ([#114](https://github.com/unjs/httpxy/pull/114))
+- **web-incoming:** Guard `req.socket` access in error handler ([#112](https://github.com/unjs/httpxy/pull/112))
+- **web-incoming:** Defer pipe until socket connects ([#111](https://github.com/unjs/httpxy/pull/111))
+- **server:** Catch synchronous exceptions in middleware passes ([#109](https://github.com/unjs/httpxy/pull/109))
+- **web-incoming:** Emit econnreset on client disconnect ([#115](https://github.com/unjs/httpxy/pull/115))
+- **ws:** Handle response stream errors on failed WS upgrade ([#116](https://github.com/unjs/httpxy/pull/116))
+- **web-outgoing:** Include HTTP 303 in redirect location rewriting ([#119](https://github.com/unjs/httpxy/pull/119))
+- **web-outgoing:** Skip empty header names ([#121](https://github.com/unjs/httpxy/pull/121))
+- **ssl:** Prevent undefined target values from overwriting ssl options ([#118](https://github.com/unjs/httpxy/pull/118))
+- **utils:** Preserve target URL query string in path merging ([#117](https://github.com/unjs/httpxy/pull/117))
+- **middleware:** Do not append duplicate x-forwarded-* header values ([#120](https://github.com/unjs/httpxy/pull/120))
+- **web-outgoing:** Strip transfer-encoding on 204/304 ([#122](https://github.com/unjs/httpxy/pull/122))
+- **web-incoming:** Use `isSSL` regex for consistent https/wss protocol checks ([#123](https://github.com/unjs/httpxy/pull/123))
+- **ws:** Preserve wss:// protocol and fix error handling in proxyUpgrade ([cb01605](https://github.com/unjs/httpxy/commit/cb01605))
+
+### 📦 Build
+
+- ⚠️  Esm-only ([d65b3f7](https://github.com/unjs/httpxy/commit/d65b3f7))
+
+### 🏡 Chore
+
+- Update deps ([743098d](https://github.com/unjs/httpxy/commit/743098d))
+
+#### ⚠️ Breaking Changes
+
+- ⚠️  Esm-only ([d65b3f7](https://github.com/unjs/httpxy/commit/d65b3f7))
+
+### ❤️ Contributors
+
+- Pooya Parsa ([@pi0](https://github.com/pi0))
+- Guoyangzhen <upgyz@qq.com>
+- Sukka <isukkaw@gmail.com>
+- Gabor Koos <gabor.koos@gmail.com>
+
 ## v0.3.1
 
 [compare changes](https://github.com/unjs/httpxy/compare/v0.3.0...v0.3.1)
