@@ -6,7 +6,7 @@
 
 ### 🔥 Performance
 
-- ⚠️  Keep-alive, request body stream and faster proxyFetch ([#124](https://github.com/unjs/httpxy/pull/124))
+- ⚠️ Keep-alive, request body stream and faster proxyFetch ([#124](https://github.com/unjs/httpxy/pull/124))
 
 ### 🏡 Chore
 
@@ -14,7 +14,7 @@
 
 #### ⚠️ Breaking Changes
 
-- ⚠️  Keep-alive, request body stream and faster proxyFetch ([#124](https://github.com/unjs/httpxy/pull/124))
+- ⚠️ Keep-alive, request body stream and faster proxyFetch ([#124](https://github.com/unjs/httpxy/pull/124))
 
 ### ❤️ Contributors
 
