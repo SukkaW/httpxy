@@ -7,6 +7,14 @@ import type { Http2ServerRequest } from "node:http2";
 const upgradeHeader = /(^|,)\s*upgrade\s*($|,)/i;
 
 /**
+ * Default keep-alive agents for connection reuse.
+ */
+export const defaultAgents = {
+  http: new httpNative.Agent({ keepAlive: true, maxSockets: 256, maxFreeSockets: 64 }),
+  https: new httpsNative.Agent({ keepAlive: true, maxSockets: 256, maxFreeSockets: 64 }),
+};
+
+/**
  * Simple Regex for testing if protocol is https
  */
 export const isSSL = /^https|wss/;
@@ -82,7 +90,9 @@ export function setupOutgoing(
   // host override must happen before composing/merging the final outgoing headers
 
   if (options.headers) {
-    outgoing.headers = { ...outgoing.headers, ...options.headers };
+    for (const key of Object.keys(options.headers)) {
+      outgoing.headers[key] = options.headers[key];
+    }
   }
 
   if (req.httpVersionMajor > 1) {
@@ -104,7 +114,16 @@ export function setupOutgoing(
     outgoing.rejectUnauthorized = options.secure === undefined ? true : options.secure;
   }
 
-  outgoing.agent = options.agent || false;
+  if (options.agent !== undefined) {
+    outgoing.agent = options.agent || false;
+  } else if (req.httpVersionMajor > 1) {
+    // HTTP/2 incoming requests: keep-alive agents can conflict with stream lifecycle
+    outgoing.agent = false;
+  } else {
+    // Use default keep-alive agents for connection reuse
+    const targetProto = (options[forward || "target"] as URL).protocol ?? "http";
+    outgoing.agent = isSSL.test(targetProto) ? defaultAgents.https : defaultAgents.http;
+  }
   outgoing.localAddress = options.localAddress;
 
   //

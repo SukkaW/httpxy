@@ -3,7 +3,7 @@ import { request as httpRequest } from "node:http";
 import { request as httpsRequest } from "node:https";
 import { Readable } from "node:stream";
 import type { ProxyAddr } from "./types.ts";
-import { isSSL, joinURL, parseAddr } from "./_utils.ts";
+import { defaultAgents, isSSL, joinURL, parseAddr } from "./_utils.ts";
 
 /**
  * Options for {@link proxyFetch}.
@@ -101,17 +101,18 @@ export async function proxyFetch(
 
   const reqHeaders: Record<string, string | string[]> = {};
   if (init.headers) {
-    const h =
-      init.headers instanceof Headers ? init.headers : new Headers(init.headers as HeadersInit);
-    for (const [key, value] of h) {
-      // Preserve multi-value headers (e.g. set-cookie) as arrays
-      if (key in reqHeaders) {
+    // Fast path: plain object — direct assign, no iteration needed
+    if (!(init.headers instanceof Headers) && !Array.isArray(init.headers)) {
+      Object.assign(reqHeaders, init.headers);
+    } else {
+      // Headers or [key, value][] — both are iterable pairs
+      for (const [key, value] of init.headers as Iterable<[string, string]>) {
         const existing = reqHeaders[key];
-        reqHeaders[key] = Array.isArray(existing)
-          ? [...existing, value]
-          : [existing as string, value];
-      } else {
-        reqHeaders[key] = value;
+        if (existing === undefined) {
+          reqHeaders[key] = value;
+        } else {
+          reqHeaders[key] = Array.isArray(existing) ? [...existing, value] : [existing, value];
+        }
       }
     }
   }
@@ -152,16 +153,27 @@ export async function proxyFetch(
         ? 5
         : 0;
 
+  // Buffer body only when redirects need replay; otherwise stream through
+  const body = maxRedirects > 0 ? await _bufferBody(init.body) : _toNodeStream(init.body);
+
+  // Default to keep-alive agent for connection reuse
+  const agent =
+    opts?.agent !== undefined
+      ? opts.agent || false
+      : useHTTPS
+        ? defaultAgents.https
+        : defaultAgents.http;
+
   const res = await _sendRequest(
     useHTTPS ? httpsRequest : httpRequest,
     init.method || "GET",
     path,
     reqHeaders,
     resolvedAddr,
-    await _bufferBody(init.body),
+    body,
     {
       signal: init.signal || undefined,
-      agent: opts?.agent,
+      agent,
       timeout: opts?.timeout,
       ssl: opts?.ssl,
       maxRedirects,
@@ -170,26 +182,27 @@ export async function proxyFetch(
     },
   );
 
-  // Build Response
-  const headers = new Headers();
-  for (const [key, value] of Object.entries(res.headers)) {
-    if (key === "transfer-encoding" || key === "keep-alive" || key === "connection") {
+  // Build Response — use plain header pairs to avoid Headers object overhead
+  const resHeaders: [string, string][] = [];
+  const rawHeaders = res.rawHeaders;
+  for (let i = 0; i < rawHeaders.length; i += 2) {
+    const key = rawHeaders[i]!;
+    const keyLower = key.toLowerCase();
+    if (
+      keyLower === "transfer-encoding" ||
+      keyLower === "keep-alive" ||
+      keyLower === "connection"
+    ) {
       continue;
     }
-    if (Array.isArray(value)) {
-      for (const v of value) {
-        headers.append(key, v);
-      }
-    } else if (value) {
-      headers.set(key, value);
-    }
+    resHeaders.push([key, rawHeaders[i + 1]!]);
   }
 
   const hasBody = res.statusCode !== 204 && res.statusCode !== 304;
   return new Response(hasBody ? (Readable.toWeb(res) as ReadableStream) : null, {
     status: res.statusCode,
     statusText: res.statusMessage,
-    headers,
+    headers: resHeaders,
   });
 }
 
@@ -210,10 +223,36 @@ function toInit(init?: RequestInit | Request): RequestInit | undefined {
   return init;
 }
 
-/** Normalize any body type to Buffer (or undefined). */
+/** Convert body to a Node.js Readable or Buffer for streaming without buffering. */
+function _toNodeStream(body: BodyInit | null | undefined): Readable | Buffer | undefined {
+  if (!body) {
+    return undefined;
+  }
+  if (typeof body === "string") {
+    return Buffer.from(body);
+  }
+  if (body instanceof ArrayBuffer || ArrayBuffer.isView(body)) {
+    return Buffer.from(body as ArrayBuffer);
+  }
+  if (body instanceof ReadableStream) {
+    return Readable.fromWeb(body as import("node:stream/web").ReadableStream);
+  }
+  if (body instanceof Blob) {
+    return Readable.fromWeb(body.stream() as import("node:stream/web").ReadableStream);
+  }
+  return Buffer.from(String(body));
+}
+
+/** Normalize any body type to Buffer (or undefined) for redirect replay. */
 async function _bufferBody(body: BodyInit | null | undefined): Promise<Buffer | undefined> {
   if (!body) {
     return undefined;
+  }
+  if (typeof body === "string") {
+    return Buffer.from(body);
+  }
+  if (body instanceof ArrayBuffer || ArrayBuffer.isView(body)) {
+    return Buffer.from(body as ArrayBuffer);
   }
   if (body instanceof ReadableStream) {
     const readable = Readable.fromWeb(body as import("node:stream/web").ReadableStream);
@@ -223,13 +262,10 @@ async function _bufferBody(body: BodyInit | null | undefined): Promise<Buffer | 
     }
     return Buffer.concat(chunks);
   }
-  if (body instanceof ArrayBuffer || ArrayBuffer.isView(body)) {
-    return Buffer.from(body as ArrayBuffer);
-  }
   if (body instanceof Blob) {
     return Buffer.from(await body.arrayBuffer());
   }
-  return Buffer.from(body as string);
+  return Buffer.from(String(body));
 }
 
 const _redirectStatuses = new Set([301, 302, 303, 307, 308]);
@@ -250,7 +286,7 @@ function _sendRequest(
   path: string,
   headers: Record<string, string | string[]>,
   addr: ProxyAddr,
-  body: Buffer | undefined,
+  body: Buffer | Readable | undefined,
   opts: _RequestOpts,
 ): Promise<IncomingMessage> {
   return new Promise<IncomingMessage>((resolve, reject) => {
@@ -258,7 +294,7 @@ function _sendRequest(
       method,
       path,
       headers,
-      agent: opts.agent ?? false,
+      agent: opts.agent,
     };
 
     if (addr.socketPath) {
@@ -336,7 +372,13 @@ function _sendRequest(
       });
     }
 
-    if (body) {
+    if (body instanceof Readable) {
+      body.on("error", (err) => {
+        req.destroy(err);
+        reject(err);
+      });
+      body.pipe(req);
+    } else if (body) {
       req.end(body);
     } else {
       req.end();
