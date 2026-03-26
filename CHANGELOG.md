@@ -1,5 +1,25 @@
 # Changelog
 
+## v0.5.0
+
+[compare changes](https://github.com/unjs/httpxy/compare/v0.4.0...v0.5.0)
+
+### 🔥 Performance
+
+- ⚠️  Keep-alive, request body stream and faster proxyFetch ([#124](https://github.com/unjs/httpxy/pull/124))
+
+### 🏡 Chore
+
+- Apply automated updates ([04aaaba](https://github.com/unjs/httpxy/commit/04aaaba))
+
+#### ⚠️ Breaking Changes
+
+- ⚠️  Keep-alive, request body stream and faster proxyFetch ([#124](https://github.com/unjs/httpxy/pull/124))
+
+### ❤️ Contributors
+
+- Pooya Parsa ([@pi0](https://github.com/pi0))
+
 ## v0.4.0
 
 [compare changes](https://github.com/unjs/httpxy/compare/v0.3.1...v0.4.0)
