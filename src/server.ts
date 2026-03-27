@@ -66,6 +66,7 @@ export class ProxyServer<
    * A function that wraps the object in a webserver, for your convenience
    * @param port - Port to listen on
    * @param hostname - The hostname to listen on
+   * @param listeningListener - A callback function that is called when the server starts listening
    */
   listen(port: number, hostname?: string, listeningListener?: () => void) {
     const closure = (
